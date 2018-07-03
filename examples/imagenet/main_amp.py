@@ -104,7 +104,8 @@ best_prec1 = 0
 args = parser.parse_args()
 
 if args.fp16:
-    amp.init(enabled=True)
+    global amp_handle
+    amp_handle = amp.init(enabled=True)
     assert torch.backends.cudnn.enabled, "fp16 mode requires cudnn backend to be enabled."
 def main():
     global best_prec1, args
@@ -303,7 +304,11 @@ def train(train_loader, model, criterion, optimizer, epoch):
         loss = loss*args.static_loss_scale
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss.backward()
+        if args.fp16:
+            with amp_handle.scale_loss(loss, optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            loss.backward()
         optimizer.step()
 
         torch.cuda.synchronize()
