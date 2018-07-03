@@ -20,7 +20,7 @@ import numpy as np
 
 try:
     from apex.parallel import DistributedDataParallel as DDP
-    from apex.fp16_utils import *
+    from apex import amp
 except ImportError:
     raise ImportError("Please install apex from https://www.github.com/nvidia/apex to run this example.")
 
@@ -102,6 +102,10 @@ def fast_collate(batch):
 
 best_prec1 = 0
 args = parser.parse_args()
+
+if args.fp16:
+    amp.init(enabled=True)
+    assert torch.backends.cudnn.enabled, "fp16 mode requires cudnn backend to be enabled."
 def main():
     global best_prec1, args
 
@@ -116,9 +120,6 @@ def main():
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
 
-    if args.fp16:
-        assert torch.backends.cudnn.enabled, "fp16 mode requires cudnn backend to be enabled."
-
     # create model
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
@@ -128,22 +129,14 @@ def main():
         model = models.__dict__[args.arch]()
 
     model = model.cuda()
-    if args.fp16:
-        model = network_to_half(model)
     if args.distributed:
         #shared param turns off bucketing in DDP, for lower latency runs this can improve perf
         model = DDP(model, shared_param=True)
 
-    global model_params, master_params
-    if args.fp16:
-        model_params, master_params = prep_param_lists(model)
-    else:
-        master_params = list(model.parameters())
-
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
 
-    optimizer = torch.optim.SGD(master_params, args.lr,
+    optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
@@ -240,9 +233,6 @@ class data_prefetcher():
         self.stream = torch.cuda.Stream()
         self.mean = torch.tensor([0.485, 0.456, 0.406]).cuda().view(1,3,1,1)
         self.std = torch.tensor([0.229, 0.224, 0.225]).cuda().view(1,3,1,1)
-        if args.fp16:
-            self.mean = self.mean.half()
-            self.std = self.std.half()
         self.preload()
 
     def preload(self):
@@ -255,10 +245,7 @@ class data_prefetcher():
         with torch.cuda.stream(self.stream):
             self.next_input = self.next_input.cuda(async=True)
             self.next_target = self.next_target.cuda(async=True)
-            if args.fp16:
-                self.next_input = self.next_input.half()
-            else:
-                self.next_input = self.next_input.float()
+            self.next_input = self.next_input.float()
             self.next_input = self.next_input.sub_(self.mean).div_(self.std)
             
     def next(self):
@@ -315,19 +302,9 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
         loss = loss*args.static_loss_scale
         # compute gradient and do SGD step
-        if args.fp16:
-            model.zero_grad()
-            loss.backward()
-            model_grads_to_master_grads(model_params, master_params)
-            if args.static_loss_scale != 1:
-                for param in master_params:
-                    param.grad.data = param.grad.data/args.static_loss_scale
-            optimizer.step()
-            master_params_to_model_params(model_params, master_params)
-        else:
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
         torch.cuda.synchronize()
         # measure elapsed time
@@ -377,14 +354,15 @@ def validate(val_loader, model, criterion):
             output = model(input_var)
             loss = criterion(output, target_var)
 
-        reduced_loss = reduce_tensor(loss.data)
-
         # measure accuracy and record loss
         prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
-
-        reduced_prec1 = reduce_tensor(prec1)
-        reduced_prec5 = reduce_tensor(prec5)
-
+        if args.distributed:
+            reduced_loss = reduce_tensor(loss.data)
+            reduced_prec1 = reduce_tensor(prec1)
+            reduced_prec5 = reduce_tensor(prec5)
+        else:
+            reduced_loss = loss.data
+            
         losses.update(to_python_float(reduced_loss), input.size(0))
         top1.update(to_python_float(prec1), input.size(0))
         top5.update(to_python_float(prec5), input.size(0))
