@@ -80,9 +80,6 @@ parser.add_argument('--rank', default=0, type=int,
 
 cudnn.benchmark = True
 
-
-import numpy as np
-
 def fast_collate(batch):
     imgs = [img[0] for img in batch]
     targets = torch.tensor([target[1] for target in batch], dtype=torch.int64)
@@ -113,8 +110,10 @@ def main():
 
     if args.distributed:
         torch.cuda.set_device(args.gpu)
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                                world_size=args.world_size, rank=args.rank)
+        dist.init_process_group(backend=args.dist_backend, 
+                                init_method=args.dist_url,
+                                world_size=args.world_size,
+                                rank=args.rank)
 
     if args.fp16:
         assert torch.backends.cudnn.enabled, "fp16 mode requires cudnn backend to be enabled."
@@ -177,8 +176,8 @@ def main():
         transforms.Compose([
             transforms.RandomResizedCrop(crop_size),
             transforms.RandomHorizontalFlip(),
-            #transforms.ToTensor(), Too slow
-            #normalize,
+            # transforms.ToTensor(), Too slow
+            # normalize,
         ]))
 
     if args.distributed:
@@ -227,19 +226,12 @@ def main():
                 'optimizer' : optimizer.state_dict(),
             }, is_best)
 
-# item() is a recent addition, so this helps with backward compatibility.
-def to_python_float(t):
-    if hasattr(t, 'item'):
-        return t.item()
-    else:
-        return t[0]
-
 class data_prefetcher():
     def __init__(self, loader):
         self.loader = iter(loader)
         self.stream = torch.cuda.Stream()
-        self.mean = torch.tensor([0.485, 0.456, 0.406]).cuda().view(1,3,1,1)
-        self.std = torch.tensor([0.229, 0.224, 0.225]).cuda().view(1,3,1,1)
+        self.mean = torch.tensor([0.485 * 255, 0.456 * 255, 0.406 * 255]).cuda().view(1,3,1,1)
+        self.std = torch.tensor([0.229 * 255, 0.224 * 255, 0.225 * 255]).cuda().view(1,3,1,1)
         if args.fp16:
             self.mean = self.mean.half()
             self.std = self.std.half()
@@ -381,10 +373,11 @@ def validate(val_loader, model, criterion):
         prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
         if args.distributed:
             reduced_loss = reduce_tensor(loss.data)
-            reduced_prec1 = reduce_tensor(prec1)
-            reduced_prec5 = reduce_tensor(prec5)
+            prec1 = reduce_tensor(prec1)
+            prec5 = reduce_tensor(prec5)
         else:
             reduced_loss = loss.data
+
         losses.update(to_python_float(reduced_loss), input.size(0))
         top1.update(to_python_float(prec1), input.size(0))
         top5.update(to_python_float(prec5), input.size(0))
